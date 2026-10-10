@@ -1,0 +1,941 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+import "./IVerifier.sol";
+import "./PoseidonT3.sol";
+
+contract ZKVoting {
+    uint256 public constant PUBLIC_SIGNAL_COUNT = 4;
+    uint256 private constant TREE_LEAVES = 8;
+    uint64 public constant REVEAL_PERIOD = 1 days;
+    uint256 public constant MAX_PARTICIPANTS = TREE_LEAVES;
+
+    IVerifier public immutable verifier;
+    uint256 public nextElectionId = 1;
+
+    struct Election {
+        string title;
+        string description;
+        address creator;
+        uint256 eligibilityRoot;
+        uint256 candidateRoot;
+        uint64 startTime;
+        uint64 endTime;
+        uint64 revealDeadline;
+        bool proposalApproved;
+        bool votingStarted;
+        bool ended;
+        bool finalized;
+        uint256 acceptedBallots;
+        uint256 revealedBallots;
+    }
+
+    mapping(uint256 => Election) private elections;
+
+    struct Candidate {
+        uint256 id;
+        address candidateAddress;
+        string name;
+    }
+
+    mapping(uint256 => Candidate[]) private electionCandidates;
+    mapping(uint256 => mapping(uint256 => bool)) public candidateAllowed;
+
+    struct Participant {
+        address wallet;
+        uint256 credentialLeaf;
+        uint256 nullifierHash;
+        bool registered;
+    }
+
+    mapping(uint256 => Participant[]) private participants;
+
+    mapping(uint256 => mapping(address => bool))
+        public registeredParticipant;
+
+    mapping(uint256 => mapping(address => uint256))
+        private participantCredentialLeaf;
+
+    mapping(uint256 => mapping(address => uint256))
+        private participantNullifierHash;
+
+    mapping(uint256 => mapping(address => uint256))
+        public participantIndex;
+
+    mapping(uint256 => mapping(uint256 => uint256))
+        private eligibilityLeaves;
+
+    mapping(uint256 => mapping(uint256 => bool))
+        private eligibilityLeafUsed;
+
+    mapping(uint256 => mapping(uint256 => bool))
+        private eligibilityNullifierUsed;
+
+    mapping(uint256 => mapping(uint256 => bool))
+        public nullifierUsed;
+
+    mapping(uint256 => mapping(uint256 => bool))
+        public voteCommitmentUsed;
+
+    mapping(uint256 => mapping(uint256 => bool))
+        public voteCommitmentRevealed;
+
+    mapping(uint256 => mapping(uint256 => uint256))
+        private voteCounts;
+
+    event VoteCreated(
+        uint256 indexed electionId,
+        address indexed creator,
+        string title,
+        string description
+    );
+
+    event CandidateAdded(
+        uint256 indexed electionId,
+        uint256 indexed candidateId,
+        address indexed candidateAddress,
+        string name
+    );
+
+    event ParticipantRegistered(
+        uint256 indexed electionId,
+        address indexed participant,
+        uint256 indexed treeIndex,
+        uint256 credentialLeaf,
+        uint256 nullifierHash,
+        uint256 eligibilityRoot
+    );
+
+    event VoteApproved(uint256 indexed electionId);
+    event VoteActivated(uint256 indexed electionId);
+
+    event VoteAccepted(
+        uint256 indexed electionId,
+        uint256 indexed nullifierHash,
+        uint256 voteCommitment
+    );
+
+    event VoteRevealed(
+        uint256 indexed electionId,
+        uint256 indexed voteCommitment,
+        uint256 candidateId
+    );
+
+    event VoteEnded(uint256 indexed electionId);
+
+    event VoteFinalized(
+        uint256 indexed electionId,
+        uint256 revealedBallots,
+        uint256 acceptedBallots
+    );
+
+    modifier voteExists(uint256 electionId) {
+        require(
+            bytes(elections[electionId].title).length > 0,
+            "Unknown vote"
+        );
+        _;
+    }
+
+    modifier onlyVoteCreator(uint256 electionId) {
+        require(
+            msg.sender == elections[electionId].creator,
+            "Not vote creator"
+        );
+        _;
+    }
+
+    constructor(address verifier_) {
+        require(verifier_ != address(0), "Zero verifier");
+        verifier = IVerifier(verifier_);
+    }
+
+    function createVote(
+        string calldata title,
+        string calldata description,
+        uint64 startTime,
+        uint64 endTime,
+        Candidate[] calldata candidates
+    )
+        external
+        returns (uint256 electionId)
+    {
+        require(bytes(title).length > 0, "Empty title");
+        require(startTime < endTime, "Invalid time range");
+        require(endTime > block.timestamp, "Vote already ended");
+        require(
+            endTime <= type(uint64).max - REVEAL_PERIOD,
+            "Vote too late"
+        );
+        require(
+            candidates.length > 0 &&
+                candidates.length <= TREE_LEAVES,
+            "Invalid candidate count"
+        );
+
+        uint256[] memory ids =
+            new uint256[](candidates.length);
+
+        for (uint256 i = 0; i < candidates.length; i++) {
+            require(
+                candidates[i].id != 0,
+                "Zero candidate ID"
+            );
+
+            require(
+                candidates[i].candidateAddress != address(0),
+                "Zero candidate address"
+            );
+
+            require(
+                bytes(candidates[i].name).length > 0,
+                "Empty candidate name"
+            );
+
+            ids[i] = candidates[i].id;
+
+            for (uint256 j = 0; j < i; j++) {
+                require(
+                    candidates[i].id != candidates[j].id,
+                    "Duplicate candidate ID"
+                );
+
+                require(
+                    candidates[i].candidateAddress !=
+                        candidates[j].candidateAddress,
+                    "Duplicate candidate address"
+                );
+            }
+        }
+
+        _sort(ids);
+
+        uint256 candidateRoot =
+            _candidateRoot(ids);
+
+        require(candidateRoot != 0, "Zero candidate root");
+
+        electionId = nextElectionId++;
+
+        Election storage e = elections[electionId];
+
+        e.title = title;
+        e.description = description;
+        e.creator = msg.sender;
+        e.candidateRoot = candidateRoot;
+        e.startTime = startTime;
+        e.endTime = endTime;
+        e.revealDeadline =
+            endTime + REVEAL_PERIOD;
+
+        for (uint256 i = 0; i < candidates.length; i++) {
+            candidateAllowed[electionId][
+                candidates[i].id
+            ] = true;
+
+            electionCandidates[electionId].push(
+                candidates[i]
+            );
+
+            emit CandidateAdded(
+                electionId,
+                candidates[i].id,
+                candidates[i].candidateAddress,
+                candidates[i].name
+            );
+        }
+
+        emit VoteCreated(
+            electionId,
+            msg.sender,
+            title,
+            description
+        );
+    }
+
+    /*
+     * Small individual getters instead of one huge getter.
+     * This avoids Solidity stack-depth problems.
+     */
+
+    function getVoteTitle(uint256 electionId)
+        external
+        view
+        voteExists(electionId)
+        returns (string memory)
+    {
+        return elections[electionId].title;
+    }
+
+    function getVoteDescription(uint256 electionId)
+        external
+        view
+        voteExists(electionId)
+        returns (string memory)
+    {
+        return elections[electionId].description;
+    }
+
+    function getVoteCreator(uint256 electionId)
+        external
+        view
+        voteExists(electionId)
+        returns (address)
+    {
+        return elections[electionId].creator;
+    }
+
+    function getVoteRoots(uint256 electionId)
+        external
+        view
+        voteExists(electionId)
+        returns (
+            uint256 eligibilityRoot,
+            uint256 candidateRoot
+        )
+    {
+        Election storage e = elections[electionId];
+
+        return (
+            e.eligibilityRoot,
+            e.candidateRoot
+        );
+    }
+
+    function getVoteTimes(uint256 electionId)
+        external
+        view
+        voteExists(electionId)
+        returns (
+            uint64 startTime,
+            uint64 endTime,
+            uint64 revealDeadline
+        )
+    {
+        Election storage e = elections[electionId];
+
+        return (
+            e.startTime,
+            e.endTime,
+            e.revealDeadline
+        );
+    }
+
+    function getVoteStatus(uint256 electionId)
+        external
+        view
+        voteExists(electionId)
+        returns (
+            bool proposalApproved,
+            bool votingStarted,
+            bool ended,
+            bool finalized
+        )
+    {
+        Election storage e = elections[electionId];
+
+        return (
+            e.proposalApproved,
+            e.votingStarted,
+            e.ended,
+            e.finalized
+        );
+    }
+
+    function getVoteBallots(uint256 electionId)
+        external
+        view
+        voteExists(electionId)
+        returns (
+            uint256 acceptedBallots,
+            uint256 revealedBallots
+        )
+    {
+        Election storage e = elections[electionId];
+
+        return (
+            e.acceptedBallots,
+            e.revealedBallots
+        );
+    }
+
+    function getElectionCandidates(uint256 electionId)
+        external
+        view
+        voteExists(electionId)
+        returns (
+            uint256[] memory ids,
+            address[] memory addresses,
+            string[] memory names
+        )
+    {
+        Candidate[] storage candidates =
+            electionCandidates[electionId];
+
+        uint256 length = candidates.length;
+
+        ids = new uint256[](length);
+        addresses = new address[](length);
+        names = new string[](length);
+
+        for (uint256 i = 0; i < length; i++) {
+            ids[i] = candidates[i].id;
+            addresses[i] =
+                candidates[i].candidateAddress;
+            names[i] = candidates[i].name;
+        }
+    }
+
+    function registerParticipant(
+        uint256 electionId,
+        address participant,
+        uint256 credentialLeaf,
+        uint256 nullifierHash
+    )
+        external
+        voteExists(electionId)
+        onlyVoteCreator(electionId)
+    {
+        require(
+            participant != address(0),
+            "Zero participant"
+        );
+
+        require(
+            !registeredParticipant[electionId][participant],
+            "Participant already registered"
+        );
+
+        require(
+            credentialLeaf != 0,
+            "Zero credential"
+        );
+
+        require(
+            nullifierHash != 0,
+            "Zero nullifier"
+        );
+
+        require(
+            !eligibilityLeafUsed[electionId][credentialLeaf],
+            "Credential already used"
+        );
+
+        require(
+            !eligibilityNullifierUsed[electionId][nullifierHash],
+            "Nullifier already used"
+        );
+
+        require(
+            participants[electionId].length <
+                MAX_PARTICIPANTS,
+            "Maximum participants reached"
+        );
+
+        uint256 treeIndex =
+            participants[electionId].length;
+
+        participants[electionId].push(
+            Participant({
+                wallet: participant,
+                credentialLeaf: credentialLeaf,
+                nullifierHash: nullifierHash,
+                registered: true
+            })
+        );
+
+        registeredParticipant[electionId][participant] =
+            true;
+
+        participantCredentialLeaf[electionId][participant] =
+            credentialLeaf;
+
+        participantNullifierHash[electionId][participant] =
+            nullifierHash;
+
+        participantIndex[electionId][participant] =
+            treeIndex;
+
+        eligibilityLeaves[electionId][treeIndex] =
+            credentialLeaf;
+
+        eligibilityLeafUsed[electionId][credentialLeaf] =
+            true;
+
+        eligibilityNullifierUsed[electionId][nullifierHash] =
+            true;
+
+        uint256 root =
+            _eligibilityRoot(electionId);
+
+        elections[electionId].eligibilityRoot =
+            root;
+
+        emit ParticipantRegistered(
+            electionId,
+            participant,
+            treeIndex,
+            credentialLeaf,
+            nullifierHash,
+            root
+        );
+    }
+
+    function getParticipantCount(uint256 electionId)
+        external
+        view
+        voteExists(electionId)
+        returns (uint256)
+    {
+        return participants[electionId].length;
+    }
+
+    function getParticipant(
+        uint256 electionId,
+        uint256 index
+    )
+        external
+        view
+        voteExists(electionId)
+        returns (
+            address wallet,
+            uint256 credentialLeaf,
+            uint256 nullifierHash,
+            bool registered
+        )
+    {
+        Participant storage p =
+            participants[electionId][index];
+
+        return (
+            p.wallet,
+            p.credentialLeaf,
+            p.nullifierHash,
+            p.registered
+        );
+    }
+
+    function getEligibilityLeaves(uint256 electionId)
+        external
+        view
+        voteExists(electionId)
+        returns (uint256[] memory leaves)
+    {
+        leaves = new uint256[](TREE_LEAVES);
+
+        for (uint256 i = 0; i < TREE_LEAVES; i++) {
+            leaves[i] =
+                eligibilityLeaves[electionId][i];
+        }
+    }
+
+    function approveVote(uint256 electionId)
+        external
+        voteExists(electionId)
+        onlyVoteCreator(electionId)
+    {
+        require(
+            elections[electionId].eligibilityRoot != 0,
+            "No participants"
+        );
+
+        require(
+            !elections[electionId].proposalApproved,
+            "Already approved"
+        );
+
+        elections[electionId].proposalApproved = true;
+
+        emit VoteApproved(electionId);
+    }
+
+    function activateVote(uint256 electionId)
+        external
+        voteExists(electionId)
+        onlyVoteCreator(electionId)
+    {
+        Election storage e = elections[electionId];
+
+        require(
+            e.proposalApproved,
+            "Vote not approved"
+        );
+
+        require(
+            participants[electionId].length > 0,
+            "No participants"
+        );
+
+        require(
+            block.timestamp >= e.startTime,
+            "Vote not started"
+        );
+
+        require(
+            block.timestamp < e.endTime,
+            "Vote ended"
+        );
+
+        require(
+            !e.ended,
+            "Vote already ended"
+        );
+
+        require(
+            !e.votingStarted,
+            "Vote already active"
+        );
+
+        e.votingStarted = true;
+
+        emit VoteActivated(electionId);
+    }
+
+    function castPrivateVote(
+        uint256 electionId,
+        uint256[2] calldata a,
+        uint256[2][2] calldata b,
+        uint256[2] calldata c,
+        uint256[PUBLIC_SIGNAL_COUNT] calldata publicSignals
+    )
+        external
+        voteExists(electionId)
+    {
+        Election storage e = elections[electionId];
+
+        require(
+            e.proposalApproved,
+            "Vote not approved"
+        );
+
+        require(
+            e.votingStarted,
+            "Vote not active"
+        );
+
+        require(
+            block.timestamp >= e.startTime,
+            "Vote not started"
+        );
+
+        require(
+            block.timestamp < e.endTime,
+            "Vote ended"
+        );
+
+        require(
+            registeredParticipant[electionId][msg.sender],
+            "Not registered"
+        );
+
+        uint256 nullifierHash =
+            publicSignals[0];
+
+        uint256 voteCommitment =
+            publicSignals[1];
+
+        require(
+            publicSignals[2] == electionId,
+            "Invalid election ID"
+        );
+
+        uint256 expectedScopeRoot =
+            PoseidonT3.hash(
+                [
+                    e.eligibilityRoot,
+                    e.candidateRoot
+                ]
+            );
+
+        require(
+            publicSignals[3] == expectedScopeRoot,
+            "Invalid scope root"
+        );
+
+        require(
+            nullifierHash != 0,
+            "Zero nullifier"
+        );
+
+        require(
+            voteCommitment != 0,
+            "Zero commitment"
+        );
+
+        require(
+            participantNullifierHash[electionId][msg.sender] ==
+                nullifierHash,
+            "Invalid nullifier"
+        );
+
+        require(
+            !nullifierUsed[electionId][nullifierHash],
+            "Nullifier already used"
+        );
+
+        require(
+            !voteCommitmentUsed[electionId][voteCommitment],
+            "Commitment already used"
+        );
+
+        require(
+            verifier.verifyProof(
+                a,
+                b,
+                c,
+                publicSignals
+            ),
+            "Invalid proof"
+        );
+
+        nullifierUsed[electionId][nullifierHash] =
+            true;
+
+        voteCommitmentUsed[electionId][voteCommitment] =
+            true;
+
+        e.acceptedBallots++;
+
+        emit VoteAccepted(
+            electionId,
+            nullifierHash,
+            voteCommitment
+        );
+    }
+
+    function endVote(uint256 electionId)
+        external
+        voteExists(electionId)
+        onlyVoteCreator(electionId)
+    {
+        Election storage e = elections[electionId];
+
+        require(
+            e.votingStarted,
+            "Vote not active"
+        );
+
+        require(
+            block.timestamp >= e.endTime,
+            "Vote still active"
+        );
+
+        require(
+            !e.ended,
+            "Vote already ended"
+        );
+
+        e.ended = true;
+
+        emit VoteEnded(electionId);
+    }
+
+    function revealVote(
+        uint256 electionId,
+        uint256 candidateId,
+        uint256 voteSalt
+    )
+        external
+        voteExists(electionId)
+    {
+        Election storage e = elections[electionId];
+
+        require(
+            e.ended,
+            "Vote not ended"
+        );
+
+        require(
+            block.timestamp <= e.revealDeadline,
+            "Reveal period ended"
+        );
+
+        require(
+            candidateAllowed[electionId][candidateId],
+            "Invalid candidate"
+        );
+
+        uint256 commitment =
+            PoseidonT3.hash(
+                [candidateId, voteSalt]
+            );
+
+        require(
+            voteCommitmentUsed[electionId][commitment],
+            "Unknown commitment"
+        );
+
+        require(
+            !voteCommitmentRevealed[electionId][commitment],
+            "Already revealed"
+        );
+
+        voteCommitmentRevealed[electionId][commitment] =
+            true;
+
+        e.revealedBallots++;
+
+        voteCounts[electionId][candidateId]++;
+
+        emit VoteRevealed(
+            electionId,
+            commitment,
+            candidateId
+        );
+    }
+
+    function finalizeVote(uint256 electionId)
+        external
+        voteExists(electionId)
+        onlyVoteCreator(electionId)
+    {
+        Election storage e = elections[electionId];
+
+        require(
+            e.ended,
+            "Vote not ended"
+        );
+
+        require(
+            block.timestamp >= e.revealDeadline,
+            "Reveal period active"
+        );
+
+        require(
+            !e.finalized,
+            "Already finalized"
+        );
+
+        e.finalized = true;
+
+        emit VoteFinalized(
+            electionId,
+            e.revealedBallots,
+            e.acceptedBallots
+        );
+    }
+
+    function getVoteCount(
+        uint256 electionId,
+        uint256 candidateId
+    )
+        external
+        view
+        voteExists(electionId)
+        returns (uint256)
+    {
+        return voteCounts[electionId][candidateId];
+    }
+
+    function _eligibilityRoot(uint256 electionId)
+        internal
+        view
+        returns (uint256)
+    {
+        uint256[8] memory level0;
+
+        for (uint256 i = 0; i < TREE_LEAVES; i++) {
+            level0[i] =
+                eligibilityLeaves[electionId][i];
+        }
+
+        uint256[4] memory level1;
+
+        for (uint256 i = 0; i < 4; i++) {
+            level1[i] =
+                PoseidonT3.hash(
+                    [
+                        level0[i * 2],
+                        level0[i * 2 + 1]
+                    ]
+                );
+        }
+
+        uint256[2] memory level2;
+
+        level2[0] =
+            PoseidonT3.hash(
+                [level1[0], level1[1]]
+            );
+
+        level2[1] =
+            PoseidonT3.hash(
+                [level1[2], level1[3]]
+            );
+
+        return PoseidonT3.hash(
+            [level2[0], level2[1]]
+        );
+    }
+
+    function _candidateRoot(
+        uint256[] memory sortedIds
+    )
+        internal
+        pure
+        returns (uint256)
+    {
+        uint256[8] memory level0;
+
+        for (uint256 i = 0; i < TREE_LEAVES; i++) {
+            if (i < sortedIds.length) {
+                level0[i] =
+                    PoseidonT3.hash(
+                        [sortedIds[i], 0]
+                    );
+            } else {
+                level0[i] = 0;
+            }
+        }
+
+        uint256[4] memory level1;
+
+        for (uint256 i = 0; i < 4; i++) {
+            level1[i] =
+                PoseidonT3.hash(
+                    [
+                        level0[i * 2],
+                        level0[i * 2 + 1]
+                    ]
+                );
+        }
+
+        uint256[2] memory level2;
+
+        level2[0] =
+            PoseidonT3.hash(
+                [level1[0], level1[1]]
+            );
+
+        level2[1] =
+            PoseidonT3.hash(
+                [level1[2], level1[3]]
+            );
+
+        return PoseidonT3.hash(
+            [level2[0], level2[1]]
+        );
+    }
+
+    function _sort(uint256[] memory values)
+        internal
+        pure
+    {
+        for (uint256 i = 1; i < values.length; i++) {
+            uint256 key = values[i];
+            uint256 j = i;
+
+            while (
+                j > 0 &&
+                values[j - 1] > key
+            ) {
+                values[j] =
+                    values[j - 1];
+
+                j--;
+            }
+
+            values[j] = key;
+        }
+    }
+}
